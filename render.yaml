@@ -1,0 +1,40 @@
+services:
+  # 1. CASOC NIDS ML API & Active Defense Engine
+  - type: web
+    name: casoc-nids-ml-api
+    env: python
+    region: oregon
+    plan: free
+    rootDir: src/flask-api
+    buildCommand: pip install -r requirements.txt
+    startCommand: python run.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: FLASK_ENV
+        value: production
+      - key: OLLAMA_BASE_URL
+        sync: false # Set to your Oracle Cloud / Ollama server URL (e.g. https://ollama.yourdomain.com)
+      - key: OLLAMA_MODEL
+        value: llama3.2
+
+  # 2. CASOC Insider Threat & UEBA Behavioral Engine
+  - type: web
+    name: casoc-insider-threat
+    env: python
+    region: oregon
+    plan: free
+    rootDir: src/insider-threat
+    buildCommand: pip install -r requirements.txt
+    startCommand: python run.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: FLASK_ENV
+        value: production
+      - key: AGENT_API_KEY
+        generateValue: true

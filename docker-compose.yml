@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  # 1. Unified SOC Command Center Gateway (Single Host Link)
+  soc-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    container_name: soc-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - INSIDER_CHECK_URL=http://insider-threat:5001/health
+      - NIDS_UI_CHECK_URL=http://soc-frontend:3000
+      - NIDS_API_CHECK_URL=http://nids-ml-api:5000/health
+    depends_on:
+      nids-ml-api:
+        condition: service_healthy
+      insider-threat:
+        condition: service_healthy
+      soc-frontend:
+        condition: service_healthy
+    networks:
+      - soc-network
+
+  # 2. SOC React Telemetry Dashboard (Vite + Nginx)
+  soc-frontend:
+    build:
+      context: ./src/frontend/my-app
+      dockerfile: Dockerfile
+    container_name: soc-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - nids-ml-api
+      - insider-threat
+    networks:
+      - soc-network
+
+  # 3. NIDS ML Inference, DPI & Active Defense Engine (Flask + LightGBM)
+  nids-ml-api:
+    build:
+      context: ./src/flask-api
+      dockerfile: Dockerfile
+    container_name: soc-nids-ml-api
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - MODEL_PATH=app/models/model.pkl
+      - MULTICLASS_MODEL_PATH=app/models/multiclass_model.pkl
+      - MULTICLASS_METADATA_PATH=app/models/multiclass_metadata.json
+      - PREDICTION_THRESHOLD=0.50
+      - SECRET_KEY=soc-nids-production-secret-key
+    volumes:
+      - nids-data:/app/instance
+    networks:
+      - soc-network
+
+  # 4. Insider Threat UEBA & Isolation Forest Detection Engine
+  insider-threat:
+    build:
+      context: ./src/insider-threat
+      dockerfile: Dockerfile
+    container_name: soc-insider-threat
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      - AGENT_API_KEY=dev-agent-key-change-in-production
+      - NIDS_API_URL=http://nids-ml-api:5000/api/ingest_insider
+      - SECRET_KEY=soc-insider-production-secret-key
+    volumes:
+      - insider-data:/app/instance
+    networks:
+      - soc-network
+
+networks:
+  soc-network:
+    driver: bridge
+
+volumes:
+  nids-data:
+    driver: local
+  insider-data:
+    driver: local
