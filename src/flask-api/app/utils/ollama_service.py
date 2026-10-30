@@ -11,8 +11,16 @@ import time
 import urllib.request
 import urllib.error
 
+import json
+import os
+import time
+import urllib.request
+import urllib.error
+
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", None)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 
 class OllamaService:
@@ -22,10 +30,12 @@ class OllamaService:
         self.cached_model = None
         self.last_check = 0
 
-    def is_available(self, timeout=1.5):
-        """Checks if the local Ollama daemon is active and responding."""
+    def is_available(self, timeout=2.0):
+        """Checks if any LLM backend (Groq, OpenAI, or local Ollama) is active."""
+        if GROQ_API_KEY or OPENAI_API_KEY:
+            return True
         try:
-            req = urllib.request.Request(f"{self.base_url}/api/tags", headers={"User-Agent": "CASOC-OllamaClient"})
+            req = urllib.request.Request(f"{self.base_url}/api/tags", headers={"User-Agent": "CASOC-Client"})
             with urllib.request.urlopen(req, timeout=timeout) as res:
                 return res.status == 200
         except Exception:
@@ -34,16 +44,19 @@ class OllamaService:
     def get_available_models(self, timeout=2.0):
         """Returns list of installed local Ollama models."""
         try:
-            req = urllib.request.Request(f"{self.base_url}/api/tags", headers={"User-Agent": "CASOC-OllamaClient"})
+            req = urllib.request.Request(f"{self.base_url}/api/tags", headers={"User-Agent": "CASOC-Client"})
             with urllib.request.urlopen(req, timeout=timeout) as res:
                 data = json.loads(res.read().decode("utf-8"))
                 models = [m.get("name", "") for m in data.get("models", [])]
                 return models
-        except Exception as e:
+        except Exception:
             return []
 
     def get_active_model(self):
-        """Picks the best available installed model: llama3.2 > mistral > qwen2.5 > first available."""
+        """Picks the fastest and best available installed model: qwen2.5:1.5b > llama3.2 > mistral."""
+        if self.preferred_model:
+            return self.preferred_model
+
         now = time.time()
         if self.cached_model and (now - self.last_check < 30):
             return self.cached_model
@@ -52,11 +65,11 @@ class OllamaService:
         self.last_check = now
 
         if not models:
-            self.cached_model = self.preferred_model
-            return self.preferred_model
+            self.cached_model = "qwen2.5:1.5b"
+            return self.cached_model
 
-        # Check preference hierarchy
-        for pref in [self.preferred_model, "llama3.2:latest", "llama3.2", "mistral", "qwen2.5:7b", "qwen2.5:1.5b", "qwen2.5"]:
+        # Prioritize qwen2.5:1.5b for fast sub-second CPU response if installed, then llama3.2
+        for pref in ["qwen2.5:1.5b", "qwen2.5:latest", "qwen2.5", "llama3.2:latest", "llama3.2", "mistral"]:
             for m in models:
                 if m == pref or m.startswith(pref.split(":")[0]):
                     self.cached_model = m
@@ -65,10 +78,65 @@ class OllamaService:
         self.cached_model = models[0]
         return models[0]
 
-    def generate(self, prompt, system_prompt=None, model=None, temperature=0.2, max_tokens=250, timeout=120):
+    def _call_cloud_gpt(self, prompt, system_prompt=None, temperature=0.3, max_tokens=400, timeout=30):
+        """Calls Groq or OpenAI chat completions API if credentials exist."""
+        api_key = GROQ_API_KEY or OPENAI_API_KEY
+        if not api_key:
+            return None
+
+        if GROQ_API_KEY:
+            endpoint = "https://api.groq.com/openai/v1/chat/completions"
+            model = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+        else:
+            endpoint = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+            model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                endpoint,
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                res_data = json.loads(res.read().decode("utf-8"))
+                choice = res_data.get("choices", [{}])[0]
+                content = choice.get("message", {}).get("content", "").strip()
+                return {
+                    "success": True,
+                    "response": content,
+                    "model": model,
+                    "provider": "Cloud GPT"
+                }
+        except Exception as e:
+            print(f"[OllamaService] Cloud GPT error: {e}")
+            return None
+
+    def generate(self, prompt, system_prompt=None, model=None, temperature=0.2, max_tokens=300, timeout=90):
         """
-        Sends generation request to local Ollama API.
+        Sends generation request to Cloud GPT (if configured) or local Ollama API.
         """
+        # 1. Try cloud LLM if configured
+        cloud_res = self._call_cloud_gpt(prompt, system_prompt=system_prompt, temperature=temperature, max_tokens=max_tokens)
+        if cloud_res and cloud_res.get("success"):
+            return cloud_res
+
+        # 2. Try local Ollama
         target_model = model or self.get_active_model()
         payload = {
             "model": target_model,
@@ -113,7 +181,7 @@ class OllamaService:
 
     def analyze_incident(self, incident_dict):
         """
-        Prompts Ollama to act as a Senior Tier-3 SOC Analyst and provide a structured
+        Prompts Ollama/GPT to act as a Senior Tier-3 SOC Analyst and provide a structured
         incident investigation report grounded in live flow telemetry and XAI features.
         """
         category = incident_dict.get("category", "Threat Incident")
@@ -149,23 +217,24 @@ Provide a concise 3-part operational assessment in under 150 words:
 
     def chat_soc_copilot(self, query, context=None):
         """
-        Interactive SOC Q&A with real-time telemetry grounding, speaking directly to the Admin.
+        Interactive SOC Q&A with real-time telemetry grounding, operating dynamically like GPT.
         """
         system_prompt = (
-            "You are CASOC Autonomous AI Copilot, a conversational, expert cybersecurity AI assistant. "
-            "You are speaking directly to the Admin of the CASOC Security Operations Center. "
-            "Always address the user warmly and authoritatively as Admin. "
-            "Provide direct, helpful, natural responses in under 120 words using clean markdown formatting. "
-            "You have complete knowledge of this project (LightGBM 21 features, Isolation Forest, TreeSHAP XAI, "
-            "DPI signatures, Active Defense honeypot sandbox, and attack simulation)."
+            "You are the CASOC Autonomous AI Security Copilot, an expert cybersecurity GPT assistant. "
+            "You are speaking directly to the Security Operations Center (SOC) Admin. "
+            "Address the user naturally as Admin. "
+            "Think, reason, and converse dynamically like ChatGPT / GPT-4. "
+            "Never reply with predefined or robotic canned templates. "
+            "Provide insightful, concise, direct answers using clean markdown formatting (bullet points, bold headers). "
+            "Ground your reasoning in the live network telemetry, firewall block status, and system architecture facts provided below."
         )
 
         context_str = ""
         if context:
-            context_str = f"\n\nLive Telemetry Context:\n{json.dumps(context, default=str)}"
+            context_str = f"\n\n[LIVE CASOC SECURITY CONTEXT & TELEMETRY]\n{json.dumps(context, indent=2, default=str)}"
 
-        prompt = f"Admin: {query}{context_str}"
-        return self.generate(prompt, system_prompt=system_prompt, temperature=0.2, max_tokens=120, timeout=15)
+        prompt = f"Admin Request: {query}{context_str}\n\nCopilot GPT Response:"
+        return self.generate(prompt, system_prompt=system_prompt, temperature=0.3, max_tokens=200, timeout=120)
 
 
 global_ollama = OllamaService()
